@@ -128,15 +128,15 @@ func TestPlaceholdersAreStable(t *testing.T) {
 func TestAdversarialInputsStayFast(t *testing.T) {
 	const size = 16 * 1024
 	inputs := map[string]string{
-		"email with a failing TLD boundary": strings.Repeat("a.", size/2) + "a@b.cc1",
+		"email with a failing TLD boundary":         strings.Repeat("a.", size/2) + "a@b.cc1",
 		"email with a Unicode letter after the TLD": strings.Repeat("a.", size/2) + "a@b.ccé",
-		"email domain of many labels": "a@" + strings.Repeat("b.", size/2) + "cc1",
-		"jwt starts inside one long run": "aeyJ" + strings.Repeat("-aeyJ", size/5) + ".aaaaa.aaaaa",
-		"key/value keyword after letters": strings.Repeat("étoken=", size/8),
-		"url scheme runs": strings.Repeat("a://", size/4),
-		"dashed words": strings.Repeat("a-", size/2),
-		"digits and dots": strings.Repeat("1.", size/2),
-		"bearer words": strings.Repeat("bearer ", size/7),
+		"email domain of many labels":               "a@" + strings.Repeat("b.", size/2) + "cc1",
+		"jwt starts inside one long run":            "aeyJ" + strings.Repeat("-aeyJ", size/5) + ".aaaaa.aaaaa",
+		"key/value keyword after letters":           strings.Repeat("étoken=", size/8),
+		"url scheme runs":                           strings.Repeat("a://", size/4),
+		"dashed words":                              strings.Repeat("a-", size/2),
+		"digits and dots":                           strings.Repeat("1.", size/2),
+		"bearer words":                              strings.Repeat("bearer ", size/7),
 	}
 	for name, in := range inputs {
 		start := time.Now()

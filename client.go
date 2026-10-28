@@ -40,11 +40,12 @@ type Entry struct {
 // Client sends records to dlogify. The zero value is not usable; create one
 // with New, or use the package functions after Init.
 type Client struct {
-	cfg  config
-	diag *diag.Diag
-	exp  *export.Exporter
-	red  *redactor
-	noop bool
+	cfg   config
+	diag  *diag.Diag
+	exp   *export.Exporter
+	red   *redactor
+	hooks *hookRunner // set when BeforeSend is
+	noop  bool
 
 	closed       atomic.Bool
 	shutdownOnce sync.Once
@@ -81,6 +82,9 @@ func newClient(opts Options, userAgent string, getenv func(string) string) (c *C
 	}
 	if !cfg.enabled {
 		return c
+	}
+	if red != nil && red.before != nil {
+		c.hooks = newHookRunner(c, cfg.maxQueueSize)
 	}
 	c.exp = export.New(export.Options{
 		URL:       cfg.logsURL,
@@ -195,6 +199,8 @@ func (c *Client) emit(rec *record.Record) {
 				c.diag.Debug("dropped a record logged inside BeforeSend")
 				return
 			}
+			c.hooks.enqueue(rec)
+			return
 		}
 		if !c.red.apply(c, rec) {
 			return
@@ -212,7 +218,11 @@ func (c *Client) Flush(timeout time.Duration) bool {
 	if timeout < 0 {
 		timeout = 0
 	}
-	return c.exp.Flush(timeout)
+	deadline := time.Now().Add(timeout)
+	if c.hooks != nil && !c.hooks.wait(deadline) {
+		return false
+	}
+	return c.exp.Flush(max(time.Until(deadline), 0))
 }
 
 // Shutdown flushes for at most timeout, stops the client and undoes what it
@@ -224,6 +234,9 @@ func (c *Client) Shutdown(timeout time.Duration) {
 	c.shutdownOnce.Do(func() {
 		c.Flush(timeout)
 		c.closed.Store(true)
+		if c.hooks != nil {
+			c.hooks.close()
+		}
 		if c.exp != nil {
 			c.exp.Close()
 		}
