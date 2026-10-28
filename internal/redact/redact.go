@@ -48,28 +48,30 @@ func runeLen(s string, i int) int {
 	return size
 }
 
-func nextBoundary(s string, i int) int {
-	for i < len(s) && !boundary(s, i) {
-		i += runeLen(s, i)
-	}
-	return i
-}
-
+// A rule is tried at every start where Rust's \b holds and startOk accepts
+// the character (a filter: it never rejects a start the pattern could
+// match), with the pattern anchored there. Both engines use leftmost-first
+// (Perl) semantics, so at a given start Go picks the same alternative as Rust.
+//
+// Cost stays linear in the input:
+//   - run: when an attempt starting on a character of this class fails, every
+//     later start in the same run fails too (the pattern's leading part must
+//     reach the end of the run either way), so the search jumps past the run.
+//   - shorter: when the trailing \b fails, Rust backtracks to a shorter match
+//     at the same start; for these rules that is the longest end at a word
+//     boundary.
 type rule struct {
-	re      *regexp.Regexp
-	full    *regexp.Regexp       // ^(?:pattern)$, for the shorter-match fallback
-	lead    bool                 // \b before the match
-	trail   func(sub []int) bool // whether this match needs \b after it
+	re      *regexp.Regexp // ^(?:pattern), without its \b assertions
+	startOk func(s string, i int) bool
+	run     func(c byte) bool
+	trail   func(sub []int) bool                 // whether this match needs \b after it
+	shorter func(s string, start, end int) []int // nil: no shorter match exists
 	replace func(s string, sub []int) string
 }
 
-func newRule(pattern string, lead bool, trail func([]int) bool, replace func(string, []int) string) *rule {
-	r := &rule{re: regexp.MustCompile(pattern), lead: lead, trail: trail, replace: replace}
-	if trail != nil {
-		r.full = regexp.MustCompile(`^(?:` + pattern + `)$`)
-	}
-	return r
-}
+func anchored(pattern string) *regexp.Regexp { return regexp.MustCompile(`^(?:` + pattern + `)`) }
+
+func anyStart(string, int) bool { return true }
 
 func always([]int) bool { return true }
 
@@ -84,40 +86,52 @@ func group(s string, sub []int, n int) string {
 	return s[sub[2*n]:sub[2*n+1]]
 }
 
-// replaceAll is Rust's replace_all for a pattern with \b at the start (lead)
-// and/or the end (trail), evaluated over the whole input.
+func (r *rule) match(s string, i int) []int {
+	sub := r.re.FindStringSubmatchIndex(s[i:])
+	if sub == nil {
+		return nil
+	}
+	for k := range sub {
+		if sub[k] >= 0 {
+			sub[k] += i
+		}
+	}
+	if r.trail != nil && r.trail(sub) && !boundary(s, sub[1]) {
+		if r.shorter == nil {
+			return nil
+		}
+		return r.shorter(s, sub[0], sub[1])
+	}
+	return sub
+}
+
+// replaceAll is Rust's replace_all for the rule, over the whole input.
 func (r *rule) replaceAll(s string) string {
 	var out strings.Builder
-	last, pos := 0, 0
-	for pos <= len(s) {
-		loc := r.re.FindStringSubmatchIndex(s[pos:])
-		if loc == nil {
-			break
-		}
-		for i := range loc {
-			if loc[i] >= 0 {
-				loc[i] += pos
-			}
-		}
-		start, end := loc[0], loc[1]
-		if r.lead && !boundary(s, start) {
-			pos = nextBoundary(s, start+runeLen(s, start))
+	last := 0
+	for i := 0; i < len(s); {
+		if !boundary(s, i) || !r.startOk(s, i) {
+			i += runeLen(s, i)
 			continue
 		}
-		if r.trail != nil && r.trail(loc) && !boundary(s, end) {
-			if loc = r.shorter(s, start, end); loc == nil {
-				pos = nextBoundary(s, start+runeLen(s, start))
-				continue
+		sub := r.match(s, i)
+		if sub == nil {
+			next := i + runeLen(s, i)
+			if r.run != nil && r.run(s[i]) {
+				for next < len(s) && r.run(s[next]) {
+					next++
+				}
 			}
-			end = loc[1]
+			i = next
+			continue
 		}
-		out.WriteString(s[last:start])
-		out.WriteString(r.replace(s, loc))
-		last = end
-		if end > start {
-			pos = end
+		out.WriteString(s[last:i])
+		out.WriteString(r.replace(s, sub))
+		last = sub[1]
+		if sub[1] > i {
+			i = sub[1]
 		} else {
-			pos = end + runeLen(s, end)
+			i += runeLen(s, i)
 		}
 	}
 	if last == 0 {
@@ -127,49 +141,137 @@ func (r *rule) replaceAll(s string) string {
 	return out.String()
 }
 
-// shorter finds the longest match at start that ends before end on a word
-// boundary.
-func (r *rule) shorter(s string, start, end int) []int {
-	for e := end - 1; e > start; e-- {
-		if !utf8.RuneStart(s[e]) || !boundary(s, e) {
-			continue
-		}
-		sub := r.full.FindStringSubmatchIndex(s[start:e])
-		if sub == nil {
-			continue
-		}
-		for i := range sub {
-			if sub[i] >= 0 {
-				sub[i] += start
+// shorterByRegex tries every word-boundary end before end, longest first,
+// with the whole pattern; only for rules whose matches are a few dozen bytes.
+func shorterByRegex(full *regexp.Regexp) func(string, int, int) []int {
+	return func(s string, start, end int) []int {
+		for e := end - 1; e > start; e-- {
+			if !utf8.RuneStart(s[e]) || !boundary(s, e) {
+				continue
+			}
+			if sub := full.FindStringSubmatchIndex(s[start:e]); sub != nil {
+				for k := range sub {
+					if sub[k] >= 0 {
+						sub[k] += start
+					}
+				}
+				return sub
 			}
 		}
-		return sub
+		return nil
 	}
-	return nil
+}
+
+func isASCIILetter(c byte) bool { return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' }
+
+func isASCIIDigit(c byte) bool { return c >= '0' && c <= '9' }
+
+// [A-Za-z0-9_\-]: JWT segments and the key of KEY_VALUE.
+func isTokenByte(c byte) bool { return isASCIILetter(c) || isASCIIDigit(c) || c == '_' || c == '-' }
+
+// [A-Za-z0-9._%+\-]: the local part of an email.
+func isLocalByte(c byte) bool {
+	return isASCIILetter(c) || isASCIIDigit(c) || c == '.' || c == '_' || c == '%' || c == '+' || c == '-'
+}
+
+// [a-z0-9+.\-], case-insensitive: a URL scheme.
+func isSchemeByte(c byte) bool {
+	return isASCIILetter(c) || isASCIIDigit(c) || c == '+' || c == '.' || c == '-'
+}
+
+// Case-insensitive classes also match U+017F and U+212A (multi-byte), so a
+// start filter for them must let non-ASCII bytes through.
+func letterOrNonASCII(s string, i int) bool { return isASCIILetter(s[i]) || s[i] >= utf8.RuneSelf }
+
+func digitOrNonASCII(s string, i int) bool { return isASCIIDigit(s[i]) || s[i] >= utf8.RuneSelf }
+
+// emailShorter finds the longest email ending before end on a word boundary:
+// the domain is labels of [A-Za-z0-9-] separated by single dots (the regex
+// already checked s[at+1:end]), and the match must end with a dot and at
+// least two ASCII letters. One pass over the domain.
+func emailShorter(s string, start, end int) []int {
+	at := strings.IndexByte(s[start:end], '@') + start
+	best := -1
+	lastNonLetter := at // index of the last non-letter byte before the current end
+	for e := at + 1; e < end; e++ {
+		c := s[e-1]
+		if !isASCIILetter(c) {
+			lastNonLetter = e - 1
+			continue
+		}
+		dot := lastNonLetter
+		if s[dot] == '.' && dot > at+1 && e-dot-1 >= 2 && boundary(s, e) {
+			best = e
+		}
+	}
+	if best < 0 {
+		return nil
+	}
+	return []int{start, best}
 }
 
 var (
-	jwt    = newRule(`eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}`, true, nil, literal("<jwt>"))
-	bearer = newRule(`(?i)(bearer)[`+ws+`]+[A-Za-z0-9\-._~+/]{8,}=*`, true, nil,
-		func(s string, sub []int) string { return group(s, sub, 1) + " <token>" })
+	jwt = &rule{
+		re:      anchored(`eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}`),
+		startOk: func(s string, i int) bool { return strings.HasPrefix(s[i:], "eyJ") },
+		run:     isTokenByte,
+		replace: literal("<jwt>"),
+	}
+	bearer = &rule{
+		re:      anchored(`(?i)(bearer)[` + ws + `]+[A-Za-z0-9\-._~+/]{8,}=*`),
+		startOk: func(s string, i int) bool { return s[i] == 'b' || s[i] == 'B' },
+		replace: func(s string, sub []int) string { return group(s, sub, 1) + " <token>" },
+	}
 	// The AKIA alternative is group 1: only it needs a \b after it.
-	secretPrefix = newRule(`(?:sk_live_|sk_test_|rk_live_|ghp_|gho_|ghs_|github_pat_|glpat-|xoxb-|xoxp-)[A-Za-z0-9_\-]{8,}|(AKIA[0-9A-Z]{16})|AIza[0-9A-Za-z_\-]{35}`,
-		true, func(sub []int) bool { return sub[2] >= 0 }, literal(Secret))
-	keyValue = newRule(`(?i)([A-Za-z0-9_\-]*(?:password|passwd|secret|token|api_key|apikey|access_key))(["']?[`+ws+`]*[=:][`+ws+`]*["']?)([^`+ws+`"'&,;}]+)`,
-		true, nil, func(s string, sub []int) string { return group(s, sub, 1) + group(s, sub, 2) + Secret })
+	secretPrefixPattern = `(?:sk_live_|sk_test_|rk_live_|ghp_|gho_|ghs_|github_pat_|glpat-|xoxb-|xoxp-)[A-Za-z0-9_\-]{8,}|(AKIA[0-9A-Z]{16})|AIza[0-9A-Za-z_\-]{35}`
+	secretPrefix        = &rule{
+		re:      anchored(secretPrefixPattern),
+		startOk: func(s string, i int) bool { return strings.IndexByte("srgxA", s[i]) >= 0 },
+		trail:   func(sub []int) bool { return sub[2] >= 0 },
+		replace: literal(Secret),
+	}
+	keyValue = &rule{
+		re:      anchored(`(?i)([A-Za-z0-9_\-]*(?:password|passwd|secret|token|api_key|apikey|access_key))(["']?[` + ws + `]*[=:][` + ws + `]*["']?)([^` + ws + `"'&,;}]+)`),
+		startOk: anyStart,
+		run:     isTokenByte,
+		replace: func(s string, sub []int) string { return group(s, sub, 1) + group(s, sub, 2) + Secret },
+	}
 	// scheme://user:password@ — the password becomes <secret>, the user is kept.
-	urlUserinfo = newRule(`(?i)([a-z][a-z0-9+.\-]*://)([^`+ws+`/@:]*):([^`+ws+`/@]+)@`,
-		true, nil, func(s string, sub []int) string { return group(s, sub, 1) + group(s, sub, 2) + ":" + Secret + "@" })
-	email = newRule(`[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}`, true, always, literal("<email>"))
-	card  = newRule(`\p{Nd}(?:[ \-]?\p{Nd}){12,18}`, true, always,
-		func(s string, sub []int) string { return redactCardCandidate(s[sub[0]:sub[1]]) })
-	ipv4 = newRule(`\p{Nd}{1,3}(?:\.\p{Nd}{1,3}){3}`, true, always, func(s string, sub []int) string {
-		m := s[sub[0]:sub[1]]
-		if addr, err := netip.ParseAddr(m); err == nil && addr.Is4() {
-			return "<ip>"
-		}
-		return m
-	})
+	urlUserinfo = &rule{
+		re:      anchored(`(?i)([a-z][a-z0-9+.\-]*://)([^` + ws + `/@:]*):([^` + ws + `/@]+)@`),
+		startOk: letterOrNonASCII,
+		run:     isSchemeByte,
+		replace: func(s string, sub []int) string { return group(s, sub, 1) + group(s, sub, 2) + ":" + Secret + "@" },
+	}
+	email = &rule{
+		re:      anchored(`[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}`),
+		startOk: func(s string, i int) bool { return isLocalByte(s[i]) },
+		run:     isLocalByte,
+		trail:   always,
+		shorter: emailShorter,
+		replace: literal("<email>"),
+	}
+	cardPattern = `\p{Nd}(?:[ \-]?\p{Nd}){12,18}`
+	card        = &rule{
+		re:      anchored(cardPattern),
+		startOk: digitOrNonASCII,
+		trail:   always,
+		shorter: shorterByRegex(regexp.MustCompile(`^(?:` + cardPattern + `)$`)),
+		replace: func(s string, sub []int) string { return redactCardCandidate(s[sub[0]:sub[1]]) },
+	}
+	ipv4 = &rule{
+		re:      anchored(`\p{Nd}{1,3}(?:\.\p{Nd}{1,3}){3}`),
+		startOk: digitOrNonASCII,
+		trail:   always,
+		shorter: shorterByRegex(regexp.MustCompile(`^(?:\p{Nd}{1,3}(?:\.\p{Nd}{1,3}){3})$`)),
+		replace: func(s string, sub []int) string {
+			m := s[sub[0]:sub[1]]
+			if addr, err := netip.ParseAddr(m); err == nil && addr.Is4() {
+				return "<ip>"
+			}
+			return m
+		},
+	}
 	digitGroup = regexp.MustCompile(`\p{Nd}+`)
 	// The candidate must not follow a letter, digit, colon or dot; that it is
 	// not followed by one is checked in code (as the engine does).
