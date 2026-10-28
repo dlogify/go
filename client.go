@@ -50,6 +50,7 @@ type Client struct {
 	shutdownOnce sync.Once
 	mu           sync.Mutex
 	undo         []func()
+	stdlog       bool     // CaptureStdLog installed
 	inHook       sync.Map // goroutine ids inside BeforeSend
 	hookDrops    atomic.Int64
 	hookFailures atomic.Int64
