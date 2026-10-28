@@ -21,7 +21,10 @@ const (
 	// After the child exits, how long its pipes may still deliver output. A
 	// background grandchild can hold them open forever; we do not wait for it.
 	pipeGrace = 500 * time.Millisecond
-	scope     = "logify.run"
+	// How long a child's death by a signal waits for the same signal to reach
+	// logify run before it is reported as one logify run did not receive.
+	signalGrace = 100 * time.Millisecond
+	scope       = "logify.run"
 )
 
 func parseArgs(args []string) (string, []string, bool) {

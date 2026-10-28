@@ -272,3 +272,25 @@ func TestPythonUnbufferedIsSet(t *testing.T) {
 		t.Fatalf("err %v, out %q", err, out)
 	}
 }
+
+// A signal sent to the whole process group (terminal Ctrl-C, systemd
+// KillMode=control-group) reaches logify run and the child together; the
+// child's death from it must not be reported, however the two race.
+func TestGroupSignalIsNotReported(t *testing.T) {
+	s := newIngest(t)
+	for i := 0; i < 60; i++ {
+		cmd := logifyCmd(s, "run", "--", "sleep", "30")
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(60 * time.Millisecond)
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGINT)
+		_ = cmd.Wait()
+	}
+	for _, r := range s.all() {
+		if strings.HasPrefix(r.Body, "Process ") {
+			t.Fatalf("reported %q", r.Body)
+		}
+	}
+}

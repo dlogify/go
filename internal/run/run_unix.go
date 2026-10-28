@@ -158,12 +158,21 @@ func runCommand(client bridge.Client, command string, args []string) int {
 	status, _ := cmd.ProcessState.Sys().(syscall.WaitStatus)
 	signaled := status.Signaled()
 	sig := status.Signal()
-	receivedMu.Lock()
-	wasReceived := received[sig]
-	receivedMu.Unlock()
+	wasReceived := func() bool {
+		receivedMu.Lock()
+		defer receivedMu.Unlock()
+		return received[sig]
+	}
+	// A signal sent to the whole process group reaches us and the child
+	// together; Wait can return before the signal goroutine has recorded it.
+	if signaled && !wasReceived() {
+		for deadline := time.Now().Add(signalGrace); time.Now().Before(deadline) && !wasReceived(); {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
 	pipelineEnded := signaled && sig == syscall.SIGPIPE && (brokenOut.Load() || brokenErr.Load())
 	switch {
-	case signaled && !wasReceived && !pipelineEnded:
+	case signaled && !wasReceived() && !pipelineEnded:
 		client.EmitRecord(record.Record{Scope: scope, Severity: record.SeverityError, Body: "Process terminated by " + signalName(sig),
 			Attrs: []record.Attr{{Key: "process.signal", Value: record.String(signalName(sig))}}})
 	case !signaled && status.ExitStatus() != 0:
